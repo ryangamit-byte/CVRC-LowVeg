@@ -10,8 +10,8 @@ const jwt = require('jsonwebtoken');
 
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET || 'change-me-in-production';
-const DB_FILE = path.join(__dirname, 'data', 'db.json');
-const EXPIRY_WARN_DAYS = 90;
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'db.json');
+const STORAGE_WARN_DAYS = 730;
 
 const round = n => Math.round(n * 1000) / 1000;
 const isDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
@@ -24,24 +24,35 @@ function init() {
     seq: { seeds: 4, tx: 0, users: 1, audit: 0 },
     users: [{ id: 1, username: 'admin', hash: bcrypt.hashSync('admin123', 10), role: 'admin', active: true }],
     seeds: [
-      { id: 1, crop: 'Ampalaya', variety: 'Galaxy F1', unit: 'kg', reorder: 5 },
-      { id: 2, crop: 'Eggplant', variety: 'Dumaguete Long Purple', unit: 'kg', reorder: 5 },
-      { id: 3, crop: 'Tomato', variety: 'Diamante Max', unit: 'kg', reorder: 3 },
-      { id: 4, crop: 'Okra', variety: 'Smooth Green', unit: 'kg', reorder: 10 },
+      { id: 1, crop: 'Ampalaya', variety: 'Galaxy F1', unit: 'kg', reorder: 5, equivalent_price: 120 },
+      { id: 2, crop: 'Eggplant', variety: 'Dumaguete Long Purple', unit: 'kg', reorder: 5, equivalent_price: 110 },
+      { id: 3, crop: 'Tomato', variety: 'Diamante Max', unit: 'kg', reorder: 3, equivalent_price: 150 },
+      { id: 4, crop: 'Okra', variety: 'Smooth Green', unit: 'kg', reorder: 10, equivalent_price: 90 },
     ],
     tx: [],
     audit: [],
   };
 }
 const db = init();
+function pruneAudit() {
+  const cutoff = Date.now() - (1000 * 60 * 60 * 24 * 30 * 6);
+  db.audit = db.audit.filter(entry => {
+    const ts = new Date(entry.ts || 0).getTime();
+    return Number.isFinite(ts) && ts >= cutoff;
+  });
+  if (db.audit.length > 2000) db.audit = db.audit.slice(-2000);
+}
 function save() {
+  pruneAudit();
   fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db, null, 2));
   fs.renameSync(DB_FILE + '.tmp', DB_FILE);
 }
 function log(user, action, detail = '') {
+  pruneAudit();
   db.audit.push({ id: ++db.seq.audit, ts: new Date().toISOString(), user, action, detail });
   if (db.audit.length > 2000) db.audit.shift();
 }
+pruneAudit();
 save();
 
 /* ---------- stock logic ---------- */
@@ -57,14 +68,30 @@ function lotsOf(id) {
   let out = db.tx.filter(t => t.seed_id === id && t.type === 'OUT').reduce((a, t) => a + t.qty, 0);
   const ins = db.tx
     .filter(t => t.seed_id === id && t.type === 'IN')
-    .sort((a, b) => (a.expiry || '9999').localeCompare(b.expiry || '9999') || a.date.localeCompare(b.date));
+    .sort((a, b) => (a.harvest_date || a.expiry || '9999').localeCompare(b.harvest_date || b.expiry || '9999') || a.date.localeCompare(b.date));
   const lots = [];
   for (const i of ins) {
     const used = Math.min(out, i.qty);
     out -= used;
-    if (i.qty - used > 0) lots.push({ lot_no: i.lot_no, expiry: i.expiry, remaining: round(i.qty - used) });
+    if (i.qty - used > 0) lots.push({ lot_no: i.lot_no, harvest_date: i.harvest_date || i.expiry || null, remaining: round(i.qty - used) });
   }
   return lots;
+}
+function qualitySummaryForSeed(id) {
+  let out = db.tx.filter(t => t.seed_id === id && t.type === 'OUT').reduce((a, t) => a + t.qty, 0);
+  const ins = db.tx
+    .filter(t => t.seed_id === id && t.type === 'IN' && ['clean', 'unclean'].includes(t.seed_quality))
+    .sort((a, b) => (a.harvest_date || a.expiry || '9999').localeCompare(b.harvest_date || b.expiry || '9999') || a.date.localeCompare(b.date));
+  const result = { clean: 0, unclean: 0 };
+  for (const i of ins) {
+    const used = Math.min(out, i.qty);
+    out -= used;
+    const remaining = round(i.qty - used);
+    if (remaining <= 0) continue;
+    if (i.seed_quality === 'clean') result.clean += remaining;
+    if (i.seed_quality === 'unclean') result.unclean += remaining;
+  }
+  return result;
 }
 function seedView(s) {
   const stock = stockOf(s.id);
@@ -73,7 +100,7 @@ function seedView(s) {
     ...s,
     stock,
     lots,
-    nearest_expiry: lots.map(l => l.expiry).filter(Boolean).sort()[0] || null,
+    nearest_harvest_date: lots.map(l => l.harvest_date).filter(Boolean).sort()[0] || null,
     status: stock <= 0 ? 'OUT' : stock <= s.reorder ? 'LOW' : 'OK',
   };
 }
@@ -124,9 +151,11 @@ function readSeed(b) {
   const variety = String(b.variety || '').trim();
   const unit = String(b.unit || 'kg').trim();
   const reorder = Number(b.reorder);
+  const equivalentPrice = Number(b.equivalent_price ?? 0);
   if (!crop || !variety) return { error: 'Crop and variety are required' };
   if (!(reorder >= 0)) return { error: 'Reorder level must be 0 or more' };
-  return { crop, variety, unit, reorder };
+  if (!(equivalentPrice >= 0)) return { error: 'Equivalent price must be 0 or more' };
+  return { crop, variety, unit, reorder, equivalent_price: round(equivalentPrice) };
 }
 app.post('/api/seeds', admin, (req, res) => {
   const v = readSeed(req.body);
@@ -173,14 +202,26 @@ app.post('/api/tx', (req, res) => {
   const b = req.body || {};
   const seed = db.seeds.find(s => s.id == b.seed_id);
   const qty = Number(b.qty);
+  const agribusinessQty = Number(b.agribusiness_qty || 0);
+  const plantingMaterialQty = Number(b.planting_material_qty || 0);
+  const regularTargetQty = Number(b.regular_target_qty || 0);
+  const harvestDate = b.harvest_date || b.expiry || null;
+  const sourceType = String(b.source_type || 'regular_supply').trim();
+  const seedQuality = ['clean', 'unclean'].includes(b.seed_quality) ? b.seed_quality : null;
   if (!seed) return res.status(400).json({ error: 'Choose a seed variety' });
   if (!['IN', 'OUT'].includes(b.type)) return res.status(400).json({ error: 'Choose stock in or stock out' });
   if (!(qty > 0)) return res.status(400).json({ error: 'Quantity must be more than 0' });
   if (!isDate(b.date)) return res.status(400).json({ error: 'Enter a valid date' });
-  if (b.type === 'IN' && b.expiry && !isDate(b.expiry)) return res.status(400).json({ error: 'Enter a valid expiry date' });
+  if (b.type === 'IN' && harvestDate && !isDate(harvestDate)) return res.status(400).json({ error: 'Enter a valid harvest date' });
+  if (b.type === 'IN' && sourceType === 'harvest' && !seedQuality) return res.status(400).json({ error: 'Harvest seed must be marked as clean or unclean' });
   const have = stockOf(seed.id);
   if (b.type === 'OUT' && qty > have)
     return res.status(400).json({ error: `Only ${have} ${seed.unit} in stock` });
+  if (b.type === 'OUT') {
+    const splitTotal = agribusinessQty + plantingMaterialQty + regularTargetQty;
+    if (splitTotal > 0 && splitTotal !== qty)
+      return res.status(400).json({ error: 'Release quantities must equal the total release quantity' });
+  }
   const t = {
     id: ++db.seq.tx,
     seed_id: seed.id,
@@ -188,9 +229,15 @@ app.post('/api/tx', (req, res) => {
     qty: round(qty),
     date: b.date,
     lot_no: String(b.lot_no || '').trim(),
-    expiry: b.type === 'IN' && b.expiry ? b.expiry : null,
-    party: String(b.party || '').trim(), // supplier (IN) or recipient (OUT)
+    harvest_date: b.type === 'IN' ? (harvestDate || null) : null,
+    expiry: b.type === 'IN' && harvestDate ? harvestDate : null,
+    source_type: b.type === 'IN' ? sourceType : null,
+    seed_quality: b.type === 'IN' ? (sourceType === 'harvest' ? seedQuality : null) : null,
+    party: String(b.party || '').trim(), // supplier/origin (IN) or recipient (OUT)
     remarks: String(b.remarks || '').trim(),
+    agribusiness_qty: b.type === 'OUT' ? round(agribusinessQty) : null,
+    planting_material_qty: b.type === 'OUT' ? round(plantingMaterialQty) : null,
+    regular_target_qty: b.type === 'OUT' ? round(regularTargetQty) : null,
     user: req.user.username,
     created_at: new Date().toISOString(),
   };
@@ -217,30 +264,86 @@ app.delete('/api/tx/:id', admin, (req, res) => {
 app.get('/api/summary', (req, res) => {
   const all = db.seeds.map(seedView);
   const now = new Date();
-  const limit = new Date(now.getTime() + EXPIRY_WARN_DAYS * 864e5).toISOString().slice(0, 10);
+  const todayIso = now.toISOString().slice(0, 10);
   const expiring = [];
   all.forEach(s =>
     s.lots.forEach(l => {
-      if (l.expiry && l.expiry <= limit) expiring.push({ seed: `${s.crop} - ${s.variety}`, unit: s.unit, ...l });
+      if (!l.harvest_date) return;
+      const harvest = new Date(l.harvest_date + 'T00:00:00Z');
+      const daysInStorage = Math.max(0, Math.floor((new Date(todayIso + 'T00:00:00Z') - harvest) / 86400000));
+      if (daysInStorage >= STORAGE_WARN_DAYS) {
+        expiring.push({ seed: `${s.crop} - ${s.variety}`, unit: s.unit, ...l, days_in_storage: daysInStorage, warn: true });
+      }
     })
   );
-  expiring.sort((a, b) => a.expiry.localeCompare(b.expiry));
+  const pricedSeeds = all.map(s => ({
+    crop: s.crop,
+    variety: s.variety,
+    unit: s.unit,
+    stock: s.stock,
+    reorder: s.reorder,
+    equivalent_price: Number(s.equivalent_price || 0),
+    total_equivalent_value: round((Number(s.equivalent_price || 0) || 0) * s.stock),
+    status: s.status,
+  }));
+  const qualityTotals = db.seeds.reduce((totals, seed) => {
+    const q = qualitySummaryForSeed(seed.id);
+    totals.clean += q.clean;
+    totals.unclean += q.unclean;
+    return totals;
+  }, { clean: 0, unclean: 0 });
+  expiring.sort((a, b) => a.harvest_date.localeCompare(b.harvest_date));
 
   const flow = [];
+  const releaseFlow = [];
+  const monthKeys = [];
+  const sumCategory = (month, key) =>
+    round(db.tx.filter(t => t.type === 'OUT' && t.date.startsWith(month) && t[key] != null).reduce((a, t) => a + Number(t[key] || 0), 0));
   for (let i = 5; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const m = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
     const sum = type => round(db.tx.filter(t => t.type === type && t.date.startsWith(m)).reduce((a, t) => a + t.qty, 0));
+    monthKeys.push(m);
     flow.push({ month: m, in: sum('IN'), out: sum('OUT') });
+    releaseFlow.push({
+      month: m,
+      agribusiness: sumCategory(m, 'agribusiness_qty'),
+      planting_material: sumCategory(m, 'planting_material_qty'),
+      regular_target: sumCategory(m, 'regular_target_qty'),
+    });
+  }
+  const monthlyBalance = [];
+  for (const seed of db.seeds) {
+    let runningBalance = 0;
+    for (const month of monthKeys) {
+      const beginningBalance = runningBalance;
+      const monthIn = round(db.tx.filter(t => t.seed_id === seed.id && t.type === 'IN' && t.date.startsWith(month)).reduce((a, t) => a + t.qty, 0));
+      const monthOut = round(db.tx.filter(t => t.seed_id === seed.id && t.type === 'OUT' && t.date.startsWith(month)).reduce((a, t) => a + t.qty, 0));
+      runningBalance += monthIn - monthOut;
+      monthlyBalance.push({
+        month,
+        crop: seed.crop,
+        variety: seed.variety,
+        beginning_balance: round(beginningBalance),
+        in: monthIn,
+        out: monthOut,
+        ending_balance: round(runningBalance),
+      });
+    }
   }
   res.json({
     total_stock: round(all.filter(s => s.unit === 'kg').reduce((a, s) => a + s.stock, 0)),
     varieties: all.length,
     low: all.filter(s => s.status !== 'OK').length,
     low_items: all.filter(s => s.status !== 'OK'),
+    priced_seeds: pricedSeeds,
     expiring,
     flow,
-    warn_days: EXPIRY_WARN_DAYS,
+    releaseFlow,
+    monthly_balance: monthlyBalance,
+    clean_stock: round(qualityTotals.clean),
+    unclean_stock: round(qualityTotals.unclean),
+    warn_days: STORAGE_WARN_DAYS,
   });
 });
 
@@ -277,4 +380,8 @@ app.put('/api/users/:id', admin, (req, res) => {
 });
 app.get('/api/audit', admin, (req, res) => res.json(db.audit.slice(-200).reverse()));
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Seed Stock Monitor running at http://localhost:${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => console.log(`Seed Stock Monitor running at http://localhost:${PORT}`));
+}
+
+module.exports = app;

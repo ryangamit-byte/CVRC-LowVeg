@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: seed-stock-monitor
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      - key: DB_FILE
+        value: /data/db.json
